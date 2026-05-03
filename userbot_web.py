@@ -1,7 +1,7 @@
 import os, re, time, asyncio, logging
 from aiohttp import web
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
@@ -12,26 +12,18 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ["SESSION"]
 
-TARGET_CHAT_RAW = os.environ["TARGET_CHAT"]
-try:
-    TARGET_CHAT = int(TARGET_CHAT_RAW)
-except ValueError:
-    TARGET_CHAT = TARGET_CHAT_RAW
-
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "10"))  # <= 10
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "10"))
 PORT = int(os.environ.get("PORT", "10000"))
 
 # --- антифлуд на отправку ---
-MIN_SEND_INTERVAL = float(os.environ.get("MIN_SEND_INTERVAL", "1.2"))  # 1.2 сек между send_message
+MIN_SEND_INTERVAL = float(os.environ.get("MIN_SEND_INTERVAL", "1.2"))
 send_lock = asyncio.Lock()
 _last_send_ts = 0.0
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-ME_ID = None  # id "Saved Messages" (= ваш user id)
-
+ME_ID = None  # id "Saved Messages"
 
 async def safe_send(chat_id, text, reply_to=None):
-    """Отправка с минимальным интервалом + автоожиданием FloodWait."""
     global _last_send_ts
     while True:
         try:
@@ -48,7 +40,6 @@ async def safe_send(chat_id, text, reply_to=None):
             wait_s = int(getattr(e, "seconds", 0)) + 1
             logging.warning("FloodWait: Telegram просит подождать %s сек", wait_s)
             await asyncio.sleep(wait_s)
-
 
 # ---------- pause ----------
 paused_until = 0
@@ -74,12 +65,6 @@ def parse_duration(s: str) -> int:
 
 # ---------- rules ----------
 def compile_pattern(spec: str) -> re.Pattern:
-    """
-    spec formats:
-      re:<regex>  - регулярка как есть
-      w:<word>    - отдельное слово (\\bword\\b)
-      <text>      - подстрока
-    """
     spec = spec.strip()
     if spec.startswith("re:"):
         return re.compile(spec[3:], re.I)
@@ -92,11 +77,27 @@ RULES = [
     {"match": "w:найден", "pattern": compile_pattern("w:найден"), "reply": ["Привет!", "/next"]},
 ]
 
+# ---------- TARGET CHAT (можно менять командой) ----------
+TARGET_CHAT_ID = None  # сюда будет записываться -100... (или id лички/группы)
+
+async def resolve_chat_id(spec: str) -> int:
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty chat spec")
+    if spec.lstrip("-").isdigit():
+        return int(spec)
+
+    # @username или username
+    if spec.startswith("@"):
+        spec = spec[1:]
+
+    entity = await client.get_entity(spec)
+    return utils.get_peer_id(entity)
+
 # ---------- КУЛДАУН (ОБЩИЙ НА ЧАТ) ЧЕРЕЗ ОЧЕРЕДЬ ----------
-# key = (chat_id,) -> общий кулдаун на чат
-queues = {}        # key -> asyncio.Queue
-workers = {}       # key -> asyncio.Task
-last_sent_ts = {}  # key -> timestamp последней ОТПРАВКИ
+queues = {}
+workers = {}
+last_sent_ts = {}
 
 async def ensure_worker(key):
     if key in workers and not workers[key].done():
@@ -108,11 +109,9 @@ async def ensure_worker(key):
         while True:
             job = await queues[key].get()
             try:
-                # если сейчас идёт пауза — ждём окончания паузы (чтобы не отправлять во время паузы)
                 while is_paused():
                     await asyncio.sleep(1.0)
 
-                # ждём, пока закончится кулдаун
                 now = time.time()
                 next_allowed = last_sent_ts.get(key, 0) + COOLDOWN_SECONDS
                 if now < next_allowed:
@@ -136,13 +135,11 @@ async def ensure_worker(key):
 
     workers[key] = asyncio.create_task(worker())
 
+# ---------- команды ----------
+@client.on(events.NewMessage(pattern=r"^/ub_chat(?:\s+(.+))?$"))
+async def cmd_chat(event):
+    global ME_ID, TARGET_CHAT_ID
 
-# ---------- control commands (только из Избранного и только от вас) ----------
-@client.on(events.NewMessage(pattern=r"^/ub(add|del|list|pause|resume|status)(?:\s+(.+))?$"))
-async def control(event):
-    global ME_ID, paused_until, RULES
-
-    # команды принимаем только от вас (outgoing)
     if not event.out:
         return
 
@@ -150,7 +147,47 @@ async def control(event):
         me = await client.get_me()
         ME_ID = me.id
 
-    # команды принимаем только из "Избранного"
+    # только из Избранного
+    if event.chat_id != ME_ID:
+        return
+
+    arg = (event.pattern_match.group(1) or "").strip()
+    if not arg:
+        await safe_send(event.chat_id, f"Текущий TARGET_CHAT_ID: {TARGET_CHAT_ID}", reply_to=event.id)
+        return
+
+    try:
+        cid = await resolve_chat_id(arg)
+        TARGET_CHAT_ID = cid
+        await safe_send(event.chat_id, f"Ок, целевой чат теперь: {TARGET_CHAT_ID}", reply_to=event.id)
+    except Exception as e:
+        await safe_send(event.chat_id, f"Не смог установить чат: {e!r}", reply_to=event.id)
+
+@client.on(events.NewMessage(pattern=r"^/ub_chatoff$"))
+async def cmd_chatoff(event):
+    global ME_ID, TARGET_CHAT_ID
+    if not event.out:
+        return
+    if ME_ID is None:
+        me = await client.get_me()
+        ME_ID = me.id
+    if event.chat_id != ME_ID:
+        return
+
+    TARGET_CHAT_ID = None
+    await safe_send(event.chat_id, "Ок, целевой чат отключен (TARGET_CHAT_ID=None).", reply_to=event.id)
+
+@client.on(events.NewMessage(pattern=r"^/ub(add|del|list|pause|resume|status)(?:\s+(.+))?$"))
+async def control(event):
+    global ME_ID, paused_until, RULES
+
+    if not event.out:
+        return
+
+    if ME_ID is None:
+        me = await client.get_me()
+        ME_ID = me.id
+
     if event.chat_id != ME_ID:
         return
 
@@ -162,8 +199,7 @@ async def control(event):
             await safe_send(event.chat_id, "Правил нет.", reply_to=event.id)
             return
         lines = [f"{i}: {r['match']} => {r['reply']}" for i, r in enumerate(RULES)]
-        text = "RULES:\n" + "\n".join(lines)
-        await safe_send(event.chat_id, text, reply_to=event.id)
+        await safe_send(event.chat_id, "RULES:\n" + "\n".join(lines), reply_to=event.id)
         return
 
     if cmd == "del":
@@ -179,7 +215,6 @@ async def control(event):
         return
 
     if cmd == "add":
-        # /ub_add <match> => msg1 || msg2 || msg3
         if "=>" not in arg:
             await safe_send(event.chat_id, "Формат: /ub_add <match> => msg1 ] msg2", reply_to=event.id)
             return
@@ -187,7 +222,6 @@ async def control(event):
         match_part, replies_part = arg.split("=>", 1)
         match_spec = match_part.strip()
 
-        # разделитель ответов:
         replies = [x.strip() for x in replies_part.split("]")]
         replies = [x for x in replies if x]
 
@@ -224,13 +258,18 @@ async def control(event):
             await safe_send(event.chat_id, "Ок, пауза включена (бессрочно).", reply_to=event.id)
         return
 
-
-# ---------- main handler ----------
-@client.on(events.NewMessage(chats=TARGET_CHAT))
+# ---------- main handler (ловим ВСЕ чаты, но реагируем только на TARGET_CHAT_ID) ----------
+@client.on(events.NewMessage)
 async def handler(event):
+    global TARGET_CHAT_ID
+
     if event.out:
         return
     if is_paused():
+        return
+    if TARGET_CHAT_ID is None:
+        return
+    if event.chat_id != TARGET_CHAT_ID:
         return
 
     text = event.raw_text or ""
@@ -239,9 +278,7 @@ async def handler(event):
         if r["pattern"].search(text):
             logging.info("MATCHED: %s | TEXT=%r", r["match"], text)
 
-            # общий кулдаун на чат
-            key = (event.chat_id,)
-
+            key = (event.chat_id,)  # общий кулдаун на чат
             await ensure_worker(key)
             await queues[key].put({
                 "chat_id": event.chat_id,
@@ -249,7 +286,6 @@ async def handler(event):
                 "msgs": r["reply"],
             })
             break
-
 
 # ---------- health server ----------
 async def start_health_server():
@@ -267,11 +303,23 @@ async def start_health_server():
     logging.info("Health server listening on :%s", PORT)
 
 async def main():
-    global ME_ID
+    global ME_ID, TARGET_CHAT_ID
+
     await start_health_server()
     await client.start()
+
     me = await client.get_me()
     ME_ID = me.id
+
+    # опционально: стартовое значение из env TARGET_CHAT (если задано)
+    raw = os.environ.get("TARGET_CHAT", "").strip()
+    if raw:
+        try:
+            TARGET_CHAT_ID = await resolve_chat_id(raw)
+            logging.info("Initial TARGET_CHAT_ID from env: %s", TARGET_CHAT_ID)
+        except Exception as e:
+            logging.warning("Cannot resolve TARGET_CHAT from env: %r", e)
+
     logging.info("Userbot started. Control via Saved Messages (chat_id=%s)", ME_ID)
     await client.run_until_disconnected()
 
