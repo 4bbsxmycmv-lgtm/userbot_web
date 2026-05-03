@@ -21,8 +21,13 @@ try:
 except ValueError:
     TARGET_CHAT = TARGET_CHAT_RAW
 
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "2"))
 PORT = int(os.environ.get("PORT", "10000"))  # Render прокидывает PORT
+
+for pattern, messages in RULES:
+    if pattern.search(text):
+        print("MATCHED RULE:", pattern.pattern, "TEXT:", repr(text))
+        ...
 
 RULES = [
     (re.compile(r"\bнайден\b", re.I), "Привет!", "/next"),
