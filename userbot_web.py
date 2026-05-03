@@ -114,11 +114,11 @@ async def control(event):
     if cmd == "add":
         # /ub_add <match> => msg1 || msg2 || msg3
         if "=>" not in arg:
-            await event.reply("Формат: /ub_add <match> => msg1 \ msg2")
+            await event.reply("Формат: /ub_add <match> => msg1 ] msg2")
             return
         match_part, replies_part = arg.split("=>", 1)
         match_spec = match_part.strip()
-        replies = [x.strip() for x in replies_part.split("\")]
+        replies = [x.strip() for x in replies_part.split("]")]
         replies = [x for x in replies if x]
 
         if not match_spec or not replies:
