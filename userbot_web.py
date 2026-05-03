@@ -2,10 +2,14 @@ import os
 import re
 import time
 import asyncio
+import logging
 from aiohttp import web
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("telethon").setLevel(logging.INFO)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
