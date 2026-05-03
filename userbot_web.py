@@ -71,7 +71,7 @@ client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 ME_ID = None  # id "Saved Messages" (= ваш user id)
 
 # ---------- control commands (только из Избранного и только от вас) ----------
-@client.on(events.NewMessage(pattern=r"^/ub_(add|del|list|pause|resume|status)(?:\s+(.+))?$"))
+@client.on(events.NewMessage(pattern=r"^/ub(add|del|list|pause|resume|status)(?:\s+(.+))?$"))
 async def control(event):
     global ME_ID, paused_until, RULES
 
@@ -114,11 +114,11 @@ async def control(event):
     if cmd == "add":
         # /ub_add <match> => msg1 || msg2 || msg3
         if "=>" not in arg:
-            await event.reply("Формат: /ub_add <match> => msg1 || msg2")
+            await event.reply("Формат: /ub_add <match> => msg1 \ msg2")
             return
         match_part, replies_part = arg.split("=>", 1)
         match_spec = match_part.strip()
-        replies = [x.strip() for x in replies_part.split("||")]
+        replies = [x.strip() for x in replies_part.split("\")]
         replies = [x for x in replies if x]
 
         if not match_spec or not replies:
