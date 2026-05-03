@@ -1,7 +1,9 @@
 import os, re, time, asyncio, logging
 from aiohttp import web
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("telethon").setLevel(logging.INFO)
@@ -16,8 +18,37 @@ try:
 except ValueError:
     TARGET_CHAT = TARGET_CHAT_RAW
 
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "2"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "10"))  # <= 10
 PORT = int(os.environ.get("PORT", "10000"))
+
+# --- антифлуд на отправку ---
+MIN_SEND_INTERVAL = float(os.environ.get("MIN_SEND_INTERVAL", "1.2"))  # 1.2 сек между send_message
+send_lock = asyncio.Lock()
+_last_send_ts = 0.0
+
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+ME_ID = None  # id "Saved Messages" (= ваш user id)
+
+
+async def safe_send(chat_id, text, reply_to=None):
+    """Отправка с минимальным интервалом + автоожиданием FloodWait."""
+    global _last_send_ts
+    while True:
+        try:
+            async with send_lock:
+                delay = MIN_SEND_INTERVAL - (time.time() - _last_send_ts)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                msg = await client.send_message(chat_id, text, reply_to=reply_to)
+                _last_send_ts = time.time()
+                return msg
+
+        except FloodWaitError as e:
+            wait_s = int(getattr(e, "seconds", 0)) + 1
+            logging.warning("FloodWait: Telegram просит подождать %s сек", wait_s)
+            await asyncio.sleep(wait_s)
+
 
 # ---------- pause ----------
 paused_until = 0
@@ -57,24 +88,21 @@ def compile_pattern(spec: str) -> re.Pattern:
         return re.compile(rf"\b{re.escape(word)}\b", re.I)
     return re.compile(re.escape(spec), re.I)
 
-# RULES = list of dicts: {"match": spec, "pattern": compiled, "reply": [msg1, msg2...]}
 RULES = [
     {"match": "w:найден", "pattern": compile_pattern("w:найден"), "reply": ["Привет!", "/next"]},
-    {"match": "w:кнопки", "pattern": compile_pattern("w:кнопки"), "reply": ["/next"]},
-    {"match": "w:доставка", "pattern": compile_pattern("w:доставка"),
-     "reply": ["Доставка: сроки и варианты — в закрепе. Уточните город, пожалуйста."]},
+
 ]
 
-last_reply_ts = {}
+# антифлуд ответа (на отправителя)
+last_reply_ts = {}  # (chat_id, sender_id) -> ts
 
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-ME_ID = None  # id "Saved Messages" (= ваш user id)
 
 # ---------- control commands (только из Избранного и только от вас) ----------
 @client.on(events.NewMessage(pattern=r"^/ub(add|del|list|pause|resume|status)(?:\s+(.+))?$"))
 async def control(event):
     global ME_ID, paused_until, RULES
 
+    # команды принимаем только от вас (outgoing)
     if not event.out:
         return
 
@@ -91,67 +119,69 @@ async def control(event):
 
     if cmd == "list":
         if not RULES:
-            await event.reply("Правил нет.")
+            await safe_send(event.chat_id, "Правил нет.", reply_to=event.id)
             return
-        lines = []
-        for i, r in enumerate(RULES):
-            lines.append(f"{i}: {r['match']} => {r['reply']}")
-        await event.reply("RULES:\n" + "\n".join(lines))
+        lines = [f"{i}: {r['match']} => {r['reply']}" for i, r in enumerate(RULES)]
+        text = "RULES:\n" + "\n".join(lines)
+        await safe_send(event.chat_id, text, reply_to=event.id)
         return
 
     if cmd == "del":
         if not arg:
-            await event.reply("Формат: /ub_del <index>")
+            await safe_send(event.chat_id, "Формат: /ub_del <index>", reply_to=event.id)
             return
         idx = int(arg)
         if idx < 0 or idx >= len(RULES):
-            await event.reply("Нет такого index.")
+            await safe_send(event.chat_id, "Нет такого index.", reply_to=event.id)
             return
         removed = RULES.pop(idx)
-        await event.reply(f"Удалено: {removed['match']}")
+        await safe_send(event.chat_id, f"Удалено: {removed['match']}", reply_to=event.id)
         return
 
     if cmd == "add":
         # /ub_add <match> => msg1 || msg2 || msg3
         if "=>" not in arg:
-            await event.reply("Формат: /ub_add <match> => msg1 ] msg2")
+            await safe_send(event.chat_id, "Формат: /ub_add <match> => msg1 ] msg2", reply_to=event.id)
             return
+
         match_part, replies_part = arg.split("=>", 1)
         match_spec = match_part.strip()
+
+        # разделитель ответов:
         replies = [x.strip() for x in replies_part.split("]")]
         replies = [x for x in replies if x]
 
         if not match_spec or not replies:
-            await event.reply("Пустой match или reply.")
+            await safe_send(event.chat_id, "Пустой match или reply.", reply_to=event.id)
             return
 
         try:
             pat = compile_pattern(match_spec)
         except Exception as e:
-            await event.reply(f"Ошибка в match: {e!r}")
+            await safe_send(event.chat_id, f"Ошибка в match: {e!r}", reply_to=event.id)
             return
 
         RULES.append({"match": match_spec, "pattern": pat, "reply": replies})
-        await event.reply(f"Добавлено: {match_spec} => {replies}")
+        await safe_send(event.chat_id, f"Добавлено: {match_spec} => {replies}", reply_to=event.id)
         return
 
     if cmd == "status":
-        await event.reply("Пауза: ВКЛ" if is_paused() else "Пауза: ВЫКЛ")
+        await safe_send(event.chat_id, ("Пауза: ВКЛ" if is_paused() else "Пауза: ВЫКЛ"), reply_to=event.id)
         return
 
     if cmd == "resume":
         paused_until = 0
-        await event.reply("Ок, снял с паузы.")
+        await safe_send(event.chat_id, "Ок, снял с паузы.", reply_to=event.id)
         return
 
     if cmd == "pause":
         if arg:
             secs = parse_duration(arg)
             paused_until = int(time.time() + secs)
-            await event.reply(f"Ок, пауза на {secs} сек.")
+            await safe_send(event.chat_id, f"Ок, пауза на {secs} сек.", reply_to=event.id)
         else:
             paused_until = int(time.time() + 10 * 365 * 24 * 3600)
-            await event.reply("Ок, пауза включена (бессрочно).")
+            await safe_send(event.chat_id, "Ок, пауза включена (бессрочно).", reply_to=event.id)
         return
 
 
@@ -167,6 +197,7 @@ async def handler(event):
     now = time.time()
     key = (event.chat_id, event.sender_id)
 
+    # антифлуд на одного отправителя
     if now - last_reply_ts.get(key, 0) < COOLDOWN_SECONDS:
         return
 
@@ -176,10 +207,13 @@ async def handler(event):
             last_reply_ts[key] = now
 
             msgs = r["reply"]
-            await event.reply(msgs[0])
+            # 1-е сообщение reply
+            await safe_send(event.chat_id, msgs[0], reply_to=event.id)
+
+            # остальные — отдельными сообщениями
             for msg in msgs[1:]:
                 await asyncio.sleep(0.5)
-                await event.respond(msg)
+                await safe_send(event.chat_id, msg)
             break
 
 
