@@ -22,17 +22,13 @@ except ValueError:
     TARGET_CHAT = TARGET_CHAT_RAW
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "2"))
-PORT = int(os.environ.get("PORT", "10000"))  # Render прокидывает PORT
+PORT = int(os.environ.get("PORT", "10000"))
 
-for pattern, messages in RULES:
-    if pattern.search(text):
-        print("MATCHED RULE:", pattern.pattern, "TEXT:", repr(text))
-        ...
-
+# ВАЖНО: второй элемент — список сообщений, которые нужно отправить по порядку
 RULES = [
-    (re.compile(r"\bнайден\b", re.I), "Привет!", "/next"),
-    (re.compile(r"\bкнпопки\b", re.I), "/next"),
-    (re.compile(r"\bдоставка\b", re.I), "Доставка: сроки и варианты — в закрепе. Уточните город, пожалуйста."),
+    (re.compile(r"\bнайден\b", re.I), ["Привет!", "/next"]),
+    (re.compile(r"\bкнопки\b", re.I), ["/next"]),  # у вас было "кнпопки" (опечатка)
+    (re.compile(r"\bдоставка\b", re.I), ["Доставка: сроки и варианты — в закрепе. Уточните город, пожалуйста."]),
 ]
 
 last_reply_ts = {}
@@ -51,10 +47,19 @@ async def handler(event):
     if now - last_reply_ts.get(key, 0) < COOLDOWN_SECONDS:
         return
 
-    for pattern, answer in RULES:
+    for pattern, messages in RULES:
         if pattern.search(text):
+            logging.info("MATCHED RULE: %s | TEXT: %r", pattern.pattern, text)
             last_reply_ts[key] = now
-            await event.reply(answer)
+
+            # 1) первое сообщение ответом (reply)
+            await event.reply(messages[0])
+
+            # 2) остальные — отдельными сообщениями
+            for msg in messages[1:]:
+                await asyncio.sleep(0.5)
+                await event.respond(msg)
+
             break
 
 async def start_health_server():
@@ -69,12 +74,12 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Health server listening on :{PORT}")
+    logging.info("Health server listening on :%s", PORT)
 
 async def main():
     await start_health_server()
     await client.start()
-    print("Userbot started")
+    logging.info("Userbot started")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
