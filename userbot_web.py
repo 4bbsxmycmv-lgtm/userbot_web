@@ -21,8 +21,8 @@ COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 PORT = int(os.environ.get("PORT", "10000"))  # Render прокидывает PORT
 
 RULES = [
-    (re.compile(r"\bпривет\b", re.I), "Привет!"),
-    (re.compile(r"\bцена\b", re.I), "Актуальная цена указана в закрепе/описании."),
+    (re.compile(r"\bнайден\b", re.I), "Привет!", "/next"),
+    (re.compile(r"\bкнпопки\b", re.I), "/next"),
     (re.compile(r"\bдоставка\b", re.I), "Доставка: сроки и варианты — в закрепе. Уточните город, пожалуйста."),
 ]
 
