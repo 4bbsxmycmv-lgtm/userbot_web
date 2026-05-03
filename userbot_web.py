@@ -90,11 +90,51 @@ def compile_pattern(spec: str) -> re.Pattern:
 
 RULES = [
     {"match": "w:найден", "pattern": compile_pattern("w:найден"), "reply": ["Привет!", "/next"]},
-
 ]
 
-# антифлуд ответа (на отправителя)
-last_reply_ts = {}  # (chat_id, sender_id) -> ts
+# ---------- КУЛДАУН (ОБЩИЙ НА ЧАТ) ЧЕРЕЗ ОЧЕРЕДЬ ----------
+# key = (chat_id,) -> общий кулдаун на чат
+queues = {}        # key -> asyncio.Queue
+workers = {}       # key -> asyncio.Task
+last_sent_ts = {}  # key -> timestamp последней ОТПРАВКИ
+
+async def ensure_worker(key):
+    if key in workers and not workers[key].done():
+        return
+    if key not in queues:
+        queues[key] = asyncio.Queue()
+
+    async def worker():
+        while True:
+            job = await queues[key].get()
+            try:
+                # если сейчас идёт пауза — ждём окончания паузы (чтобы не отправлять во время паузы)
+                while is_paused():
+                    await asyncio.sleep(1.0)
+
+                # ждём, пока закончится кулдаун
+                now = time.time()
+                next_allowed = last_sent_ts.get(key, 0) + COOLDOWN_SECONDS
+                if now < next_allowed:
+                    await asyncio.sleep(next_allowed - now)
+
+                chat_id = job["chat_id"]
+                reply_to = job["reply_to"]
+                msgs = job["msgs"]
+
+                await safe_send(chat_id, msgs[0], reply_to=reply_to)
+                for msg in msgs[1:]:
+                    await asyncio.sleep(0.5)
+                    await safe_send(chat_id, msg)
+
+                last_sent_ts[key] = time.time()
+
+            except Exception as e:
+                logging.exception("Worker error: %r", e)
+            finally:
+                queues[key].task_done()
+
+    workers[key] = asyncio.create_task(worker())
 
 
 # ---------- control commands (только из Избранного и только от вас) ----------
@@ -194,26 +234,20 @@ async def handler(event):
         return
 
     text = event.raw_text or ""
-    now = time.time()
-    key = (event.chat_id, event.sender_id)
-
-    # антифлуд на одного отправителя
-    if now - last_reply_ts.get(key, 0) < COOLDOWN_SECONDS:
-        return
 
     for r in RULES:
         if r["pattern"].search(text):
             logging.info("MATCHED: %s | TEXT=%r", r["match"], text)
-            last_reply_ts[key] = now
 
-            msgs = r["reply"]
-            # 1-е сообщение reply
-            await safe_send(event.chat_id, msgs[0], reply_to=event.id)
+            # общий кулдаун на чат
+            key = (event.chat_id,)
 
-            # остальные — отдельными сообщениями
-            for msg in msgs[1:]:
-                await asyncio.sleep(0.5)
-                await safe_send(event.chat_id, msg)
+            await ensure_worker(key)
+            await queues[key].put({
+                "chat_id": event.chat_id,
+                "reply_to": event.id,
+                "msgs": r["reply"],
+            })
             break
 
 
